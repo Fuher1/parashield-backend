@@ -14,6 +14,18 @@ import {
   Horizon,
   xdr,
 } from "@stellar/stellar-sdk";
+import {
+  HorizonCircuitBreaker,
+  HorizonTimeoutError,
+  isRetryableHorizonError,
+  isTimeoutError,
+} from "./horizon-resilience";
+
+/** Horizon retry tuning: attempts per call and the exponential backoff schedule. */
+const HORIZON_MAX_ATTEMPTS = 3;
+const HORIZON_BACKOFF_BASE_MS = 500; // 500ms, 1s, 2s...
+const HORIZON_BACKOFF_MAX_MS = 5000;
+const HORIZON_DEFAULT_TIMEOUT_MS = 10000;
 
 /**
  * #187 — a reverting contract call is a deterministic simulation failure:
@@ -92,6 +104,10 @@ export class StellarService {
   // the same account would race on sequence numbers and fail with
   // TRANSACTION_BAD_SEQ. A simple promise-chain mutex serializes them.
   private readonly accountLocks = new Map<string, Promise<void>>();
+
+  // Fails Horizon calls fast after repeated timeouts instead of letting every
+  // request wait out the full retry schedule against an unresponsive node.
+  private readonly horizonBreaker = new HorizonCircuitBreaker();
 
   private async withAccountLock<T>(publicKey: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.accountLocks.get(publicKey) ?? Promise.resolve();
@@ -667,6 +683,47 @@ export class StellarService {
   }
 
   /**
+   * Run a Horizon request with a per-attempt timeout, retrying timeouts and
+   * transient failures (network errors, 429, 5xx) with exponential backoff.
+   * Deterministic errors (e.g. 404) are rethrown immediately. If every attempt
+   * timed out, throws a typed HorizonTimeoutError and counts it toward the
+   * Horizon circuit breaker, which fails calls fast while open.
+   */
+  private async callHorizon<T>(
+    operation: string,
+    fn: () => Promise<T>,
+    timeoutMs: number = HORIZON_DEFAULT_TIMEOUT_MS,
+    maxAttempts: number = HORIZON_MAX_ATTEMPTS,
+  ): Promise<T> {
+    this.horizonBreaker.acquire(operation);
+    const attempts = Math.max(1, maxAttempts);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const result = await this.withTimeout(fn(), `Horizon ${operation}`, timeoutMs);
+        this.horizonBreaker.recordResponse();
+        return result;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!isRetryableHorizonError(err) || attempt >= attempts) {
+          if (isTimeoutError(err)) {
+            this.horizonBreaker.recordTimeout();
+            throw new HorizonTimeoutError(operation, attempt, timeoutMs);
+          }
+          this.horizonBreaker.recordResponse();
+          throw err;
+        }
+        const backoffMs = isRateLimitError(err)
+          ? Math.min(5000 * Math.pow(2, attempt - 1), 30000)
+          : Math.min(HORIZON_BACKOFF_BASE_MS * Math.pow(2, attempt - 1), HORIZON_BACKOFF_MAX_MS);
+        this.logger.warn(
+          `Horizon ${operation} attempt ${attempt}/${attempts} failed: ${message} — retrying in ${backoffMs}ms`,
+        );
+        await this.sleep(backoffMs);
+      }
+    }
+  }
+
+  /**
    * Reads an account's native XLM balance from its ledger entry over the RPC.
    * Returns a 7-decimal string like Horizon does, or "0" when the account
    * does not exist.
@@ -703,8 +760,16 @@ export class StellarService {
    *                   Health checks (#338) pass a much shorter timeout so a
    *                   slow Horizon response doesn't block a load balancer's
    *                   health probe long enough to trigger a pod restart.
+   * @param maxAttempts  Horizon attempts before giving up (default 3). Health
+   *                   checks pass 1 so retries don't multiply probe latency.
+   * @throws HorizonTimeoutError when every Horizon attempt timed out.
+   * @throws HorizonUnavailableError when the Horizon circuit is open.
    */
-  async getAccountBalance(publicKey: string, timeoutMs?: number): Promise<string> {
+  async getAccountBalance(
+    publicKey: string,
+    timeoutMs?: number,
+    maxAttempts?: number,
+  ): Promise<string> {
     // #530 — the account's ledger entry carries its native balance, so ask the
     // RPC first and only fall back to Horizon if the RPC cannot answer.
     try {
@@ -718,10 +783,11 @@ export class StellarService {
     }
     let account: Awaited<ReturnType<typeof this.horizon.loadAccount>>;
     try {
-      account = await this.withTimeout(
-        this.horizon.loadAccount(publicKey),
+      account = await this.callHorizon(
         "loadAccount",
+        () => this.horizon.loadAccount(publicKey),
         timeoutMs,
+        maxAttempts,
       );
     } catch (err) {
       // #515 — horizon.loadAccount throws when the account does not exist on

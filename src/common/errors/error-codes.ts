@@ -38,6 +38,12 @@ export enum ErrorCode {
 
   // ── Service availability ──────────────────────────────────────────────────
   SERVICE_UNAVAILABLE   = 'SERVICE_UNAVAILABLE',
+
+  // ── Stellar Horizon ───────────────────────────────────────────────────────
+  // Horizon did not respond in time after retries; transient, safe to retry.
+  HORIZON_TIMEOUT       = 'HORIZON_TIMEOUT',
+  // Horizon circuit is open after repeated timeouts; retry after a short wait.
+  HORIZON_UNAVAILABLE   = 'HORIZON_UNAVAILABLE',
 }
 
 /**

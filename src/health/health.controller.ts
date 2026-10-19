@@ -481,6 +481,8 @@ export class HealthController {
           keeperBalanceXlm = await this.stellar.getAccountBalance(
             this.stellar.keeperPublicKey,
             HEALTH_CHECK_RPC_TIMEOUT_MS,
+            // One Horizon attempt: retries would multiply probe latency (#338).
+            1,
           );
 
           // #191 — RPC reachability alone isn't enough: a keeper account

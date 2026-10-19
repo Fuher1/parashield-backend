@@ -1,6 +1,8 @@
 import { Test, TestingModule } from "@nestjs/testing";
 import { ConfigService } from "@nestjs/config";
 import { StellarService } from "./stellar.service";
+import { HorizonTimeoutError, HorizonUnavailableError } from "./horizon-resilience";
+import { ErrorCode } from "../common/errors/error-codes";
 
 jest.mock("@stellar/stellar-sdk", () => ({
   Networks: {
@@ -753,6 +755,99 @@ describe("StellarService", () => {
       mockHorizon.loadAccount.mockRejectedValue(new Error("account not found"));
 
       await expect(service.getAccountBalance("GSOMEACCOUNT")).rejects.toThrow("account not found");
+      // Deterministic errors are not retried.
+      expect(mockHorizon.loadAccount).toHaveBeenCalledTimes(1);
+    });
+
+    describe("Horizon timeouts", () => {
+      let sleepSpy: jest.SpyInstance;
+      const hang = () => new Promise<never>(() => {});
+
+      beforeEach(() => {
+        sleepSpy = jest
+          .spyOn(service as unknown as { sleep: (ms: number) => Promise<void> }, "sleep")
+          .mockResolvedValue(undefined);
+        jest.spyOn((service as any).logger, "warn").mockImplementation();
+        jest.spyOn((service as any).logger, "error").mockImplementation();
+      });
+
+      it("retries a timed-out request with exponential backoff and returns on recovery", async () => {
+        mockHorizon.loadAccount
+          .mockImplementationOnce(hang)
+          .mockImplementationOnce(hang)
+          .mockResolvedValueOnce({ balances: [{ asset_type: "native", balance: "42.0000000" }] });
+
+        const balance = await service.getAccountBalance("GSOMEACCOUNT", 5);
+
+        expect(balance).toBe("42.0000000");
+        expect(mockHorizon.loadAccount).toHaveBeenCalledTimes(3);
+        expect(sleepSpy.mock.calls.map(([ms]) => ms)).toEqual([500, 1000]);
+      });
+
+      it("throws a typed HorizonTimeoutError (504) once every attempt times out", async () => {
+        mockHorizon.loadAccount.mockImplementation(hang);
+
+        const err = await service.getAccountBalance("GSOMEACCOUNT", 5).catch((e) => e);
+
+        expect(err).toBeInstanceOf(HorizonTimeoutError);
+        expect(err.getStatus()).toBe(504);
+        expect(err.getResponse()).toMatchObject({ errorCode: ErrorCode.HORIZON_TIMEOUT });
+        expect(err.attempts).toBe(3);
+        expect(mockHorizon.loadAccount).toHaveBeenCalledTimes(3);
+      });
+
+      it("retries transient 5xx responses but not 404s", async () => {
+        mockHorizon.loadAccount
+          .mockRejectedValueOnce({ response: { status: 503 } })
+          .mockRejectedValueOnce({ response: { status: 404 } });
+
+        await expect(service.getAccountBalance("GSOMEACCOUNT", 5)).resolves.toBe("0");
+        expect(mockHorizon.loadAccount).toHaveBeenCalledTimes(2);
+      });
+
+      it("honours maxAttempts (health checks make a single attempt)", async () => {
+        mockHorizon.loadAccount.mockImplementation(hang);
+
+        await expect(service.getAccountBalance("GSOMEACCOUNT", 5, 1)).rejects.toBeInstanceOf(HorizonTimeoutError);
+        expect(mockHorizon.loadAccount).toHaveBeenCalledTimes(1);
+        expect(sleepSpy).not.toHaveBeenCalled();
+      });
+
+      it("opens the circuit after repeated timeouts and fails fast with HorizonUnavailableError (503)", async () => {
+        mockHorizon.loadAccount.mockImplementation(hang);
+
+        for (let i = 0; i < 3; i++) {
+          await expect(service.getAccountBalance("GSOMEACCOUNT", 5, 1)).rejects.toBeInstanceOf(HorizonTimeoutError);
+        }
+        mockHorizon.loadAccount.mockClear();
+
+        const err = await service.getAccountBalance("GSOMEACCOUNT", 5).catch((e) => e);
+        expect(err).toBeInstanceOf(HorizonUnavailableError);
+        expect(err.getStatus()).toBe(503);
+        expect(err.getResponse()).toMatchObject({ errorCode: ErrorCode.HORIZON_UNAVAILABLE });
+        expect(mockHorizon.loadAccount).not.toHaveBeenCalled();
+      });
+
+      it("lets a probe through after the reset window and closes the circuit on success", async () => {
+        const nowSpy = jest.spyOn(Date, "now");
+        let now = 1_000_000;
+        nowSpy.mockImplementation(() => now);
+        try {
+          mockHorizon.loadAccount.mockImplementation(hang);
+          for (let i = 0; i < 3; i++) {
+            await service.getAccountBalance("GSOMEACCOUNT", 5, 1).catch(() => undefined);
+          }
+          await expect(service.getAccountBalance("GSOMEACCOUNT", 5)).rejects.toBeInstanceOf(HorizonUnavailableError);
+
+          now += 30_000;
+          mockHorizon.loadAccount.mockResolvedValue({ balances: [{ asset_type: "native", balance: "1.0000000" }] });
+
+          await expect(service.getAccountBalance("GSOMEACCOUNT", 5)).resolves.toBe("1.0000000");
+          await expect(service.getAccountBalance("GSOMEACCOUNT", 5)).resolves.toBe("1.0000000");
+        } finally {
+          nowSpy.mockRestore();
+        }
+      });
     });
   });
 
