@@ -21,7 +21,11 @@ Supporting infrastructure:
 - **PrismaService** — PostgreSQL integration for policy and oracle data storage
 - **AuthModule** — Stellar wallet signature verification + JWT issuance
 - **LoggingInterceptor** — Request/response duration logging
-- **ThrottleGuard** — IP-based rate limiting (60 req/min)
+- **UserThrottlerGuard** — anonymous callers use per-IP rate limiting (60 req/min);
+  authenticated callers use isolated per-wallet buckets with a 5× higher quota
+
+Server configuration validates `PORT` during startup. It must be an integer in
+the TCP port range `1`–`65535`; when omitted, the API uses port `3001`.
 - **Vault bootstrap** — optional HashiCorp Vault KV loading before Nest validates env vars
 - **OpenTelemetry** — optional distributed tracing when OTEL packages are installed/configured
 
@@ -424,6 +428,14 @@ For reference, successful responses use the complementary envelope:
 
 Monetary values are returned as strings in 7-decimal fixed-point format matching Stellar asset precision (e.g. `"10.0000000"`).
 
+### Premium-rate changes
+
+Each product premium-rate template has a monotonically increasing version.
+Changing `premiumRate` creates the next version; edits to unrelated product
+fields do not. A policy records both the rate and template version in effect at
+purchase time. Later product updates affect new quotes and policies only—an
+existing policy's premium terms are never changed retroactively.
+
 ### BigInt serialization & API contract change (#671)
 
 All `BigInt` values (such as oracle readings, large policy IDs, and 64-bit timestamps or token amounts) are centrally serialized as decimal strings across all JSON responses, SSE streams, logging paths, and error envelopes.
@@ -480,6 +492,11 @@ CONCURRENCY_TEST_DATABASE_URL=postgresql://.../parashield_test npx jest claims.c
 | DeFi exploit | Stellar RPC event stream | No |
 
 **Threshold evaluation (#712):** oracle readings are 7-decimal fixed point (e.g. `324000000` = 32.4) and product thresholds are `Decimal(20,7)`. Trigger comparisons are done on exact scaled `BigInt` values (`src/common/utils/decimal.ts`) rather than `parseFloat`, so the last decimal place is never lost and a reading exactly equal to the threshold never triggers (strict `LessThan` / greater-than).
+
+**Claim evaluation isolation:** the policy and its latest oracle reading are
+loaded inside one PostgreSQL `REPEATABLE READ` transaction. Updates committed
+after evaluation begins are intentionally deferred to the next evaluation, so
+a decision never combines an old policy with a new oracle-key state.
 
 ---
 
