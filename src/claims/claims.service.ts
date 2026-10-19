@@ -665,6 +665,35 @@ export class ClaimsService {
       });
     }
 
+    // #698 - validate the policy coverage against the product limit before creating
+    // or submitting a claim. Policies created before this guard (or changed by
+    // direct database access) must not result in an over-limit payout.
+    const product = await this.policyService.getProductById(policy.productId);
+    if (!product) {
+      throw new NotFoundException('Product ' + policy.productId + ' not found for policy ' + policyId);
+    }
+    const coverageLimit = new Prisma.Decimal(product.coverageMax);
+    if (policy.coverageXlm.gt(coverageLimit)) {
+      throw new BadRequestException(
+        'Claim amount ' + policy.coverageXlm.toString() + ' exceeds the policy coverage limit of ' + coverageLimit.toString(),
+      );
+    }
+
+    // Duplicate claim guard: prevent double payouts or duplicate in-flight submissions
+    const existingClaim = await this.prisma.claim.findFirst({
+      where: {
+        policyId,
+        status: { in: [ClaimStatus.PAID, ClaimStatus.PROCESSING, ClaimStatus.PENDING] },
+      },
+    });
+
+    if (existingClaim) {
+      this.logger.warn(
+        `Duplicate claim attempt for policy ${policyId} — existing claim id=${existingClaim.id} status=${existingClaim.status}`,
+      );
+      throw new ConflictException({ message: 'Claim already exists for this policy', errorCode: ErrorCode.CLAIM_ALREADY_EXISTS });
+    }
+
     const contractId = this.config.get<string>('CLAIMS_PROCESSOR_CONTRACT') ?? '';
     if (!contractId || !/^C[A-Z2-7]{55}$/.test(contractId)) {
       throw new BadGatewayException(
